@@ -53,6 +53,7 @@ typedef enum { KQL_PREVIEW = 0, KQL_THUMB = 1 } kql_mode;
 typedef struct {
     uint32_t width, height, levels, faces, layers, vk_format, supercompression;
     uint32_t level_used;
+    int      is_ktx1;           /* исходник — KTX1, конвертируется через ktx2ktx2 */
 } kql_info;
 
 /* Каталог, где лежит ktx-path.txt (Contents/Resources плагина). Можно NULL. */
