@@ -41,22 +41,21 @@ jobs:
           codesign --force --sign - "$B"
           codesign --verify --verbose=2 "$B"
 
-      - name: Package
+      - name: Package (ready-to-use bundle)
         run: |
           set -euo pipefail
           mkdir -p dist
-          tar -C build -czf dist/KtxQuickLook.qlgenerator.tar.gz KtxQuickLook.qlgenerator
-          cp install.sh dist/install.sh
-          chmod +x dist/install.sh
+          # ditto сохраняет структуру бандла; внутри zip лежит папка KtxQuickLook.qlgenerator
+          ditto -c -k --keepParent build/KtxQuickLook.qlgenerator dist/KtxQuickLook.qlgenerator.zip
           ls -la dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: KtxQuickLook-macos-x86_64
-          path: dist/*
+          path: dist/KtxQuickLook.qlgenerator.zip
 
       - name: Publish release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: dist/KtxQuickLook.qlgenerator.zip
