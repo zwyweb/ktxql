@@ -14,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/file.h>
+#include <sys/select.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -68,6 +69,51 @@ static int is_exec(const char *p) {
     return p && *p && stat(p, &st) == 0 && S_ISREG(st.st_mode) && access(p, X_OK) == 0;
 }
 
+static int cache_dir(char *out, size_t cap);
+
+/* Спрашиваем у логин-шелла пользователя, где лежит ktx (его настоящий PATH). Результат кэшируется на диске. */
+static int shell_lookup(char *out, size_t cap) {
+    struct passwd *pw = getpwuid(getuid());
+    const char *sh = (pw && pw->pw_shell && *pw->pw_shell) ? pw->pw_shell : "/bin/zsh";
+    int fds[2];
+    if (pipe(fds) != 0) return 0;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    char *argv[] = { (char *)sh, "-l", "-i", "-c", "command -v ktx", NULL };
+    pid_t pid;
+    int rc = posix_spawn(&pid, sh, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if (rc != 0) { close(fds[0]); return 0; }
+
+    char buf[PATH_MAX] = ""; size_t len = 0;
+    double deadline = now_s() + 4.0;
+    for (;;) {
+        double left = deadline - now_s();
+        if (left <= 0) break;
+        fd_set rs; FD_ZERO(&rs); FD_SET(fds[0], &rs);
+        struct timeval tv = { (time_t)left, (suseconds_t)((left - (time_t)left) * 1e6) };
+        if (select(fds[0] + 1, &rs, NULL, NULL, &tv) <= 0) break;
+        ssize_t n = read(fds[0], buf + len, sizeof buf - 1 - len);
+        if (n <= 0) break;
+        len += (size_t)n;
+        if (len >= sizeof buf - 1) break;
+    }
+    close(fds[0]);
+    kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+    buf[len] = 0;
+    /* берём последнюю непустую строку, начинающуюся с '/' (rc-файлы могут что-то печатать) */
+    char *best = NULL;
+    for (char *l = strtok(buf, "\r\n"); l; l = strtok(NULL, "\r\n")) if (l[0] == '/') best = l;
+    if (!best || !is_exec(best)) return 0;
+    snprintf(out, cap, "%s", best);
+    return 1;
+}
+
 static const char *find_ktx(void) {
     static char buf[PATH_MAX];
     const char *e = getenv("KTXQL_BIN");
@@ -100,6 +146,27 @@ static const char *find_ktx(void) {
         snprintf(buf, sizeof buf, "%s/bin/ktx", pw->pw_dir);
         if (is_exec(buf)) return buf;
     }
+
+    /* последний шанс: путь, найденный ранее через шелл (кэш), либо спросить шелл сейчас */
+    char dir[PATH_MAX], cf[PATH_MAX];
+    if (cache_dir(dir, sizeof dir) == 0) {
+        snprintf(cf, sizeof cf, "%s/ktxpath.txt", dir);
+        FILE *f = fopen(cf, "r");
+        if (f) {
+            char line[PATH_MAX] = "";
+            if (fgets(line, sizeof line, f)) {
+                size_t n = strlen(line);
+                while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
+                if (is_exec(line)) { fclose(f); snprintf(buf, sizeof buf, "%s", line); return buf; }
+            }
+            fclose(f);
+        }
+        if (shell_lookup(buf, sizeof buf)) {
+            f = fopen(cf, "w");
+            if (f) { fprintf(f, "%s\n", buf); fclose(f); }
+            return buf;
+        }
+    }
     return NULL;
 }
 
@@ -111,22 +178,35 @@ static uint32_t rd32(const uint8_t *p) {
 }
 
 static kql_status read_header(const char *path, kql_info *in, struct stat *st) {
-    static const uint8_t magic[12] = { 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, '\r', '\n', 0x1A, '\n' };
+    static const uint8_t magic2[12] = { 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, '\r', '\n', 0x1A, '\n' };
+    static const uint8_t magic1[12] = { 0xAB, 'K', 'T', 'X', ' ', '1', '1', 0xBB, '\r', '\n', 0x1A, '\n' };
     int fd = open(path, O_RDONLY);
     if (fd < 0) return KQL_ERR_FAILED;
     if (fstat(fd, st) != 0) { close(fd); return KQL_ERR_FAILED; }
-    uint8_t h[48];
+    uint8_t h[64];
     ssize_t n = read(fd, h, sizeof h);
     close(fd);
-    if (n < (ssize_t)sizeof h || memcmp(h, magic, 12) != 0) return KQL_ERR_NOT_KTX2;
+    if (n < 48) return KQL_ERR_NOT_KTX2;
     memset(in, 0, sizeof *in);
-    in->vk_format = rd32(h + 12);
-    in->width     = rd32(h + 20);
-    in->height    = rd32(h + 24);
-    in->layers    = rd32(h + 32);
-    in->faces     = rd32(h + 36);
-    in->levels    = rd32(h + 40);
-    in->supercompression = rd32(h + 44);
+    if (memcmp(h, magic2, 12) == 0) {
+        in->vk_format = rd32(h + 12);
+        in->width     = rd32(h + 20);
+        in->height    = rd32(h + 24);
+        in->layers    = rd32(h + 32);
+        in->faces     = rd32(h + 36);
+        in->levels    = rd32(h + 40);
+        in->supercompression = rd32(h + 44);
+    } else if (n >= 64 && memcmp(h, magic1, 12) == 0) {
+        if (rd32(h + 12) != 0x04030201u) return KQL_ERR_NOT_KTX2;   /* big-endian KTX1 не поддерживаем */
+        in->is_ktx1 = 1;
+        in->width  = rd32(h + 36);
+        in->height = rd32(h + 40);
+        in->layers = rd32(h + 48);
+        in->faces  = rd32(h + 52);
+        in->levels = rd32(h + 56);
+    } else {
+        return KQL_ERR_NOT_KTX2;
+    }
     if (in->width == 0) return KQL_ERR_NOT_KTX2;
     if (in->height == 0) in->height = 1;
     if (in->levels == 0) in->levels = 1;
@@ -231,10 +311,8 @@ static int acquire_slot(const char *dir, double deadline) {
     }
 }
 
-static kql_status run_ktx(const char *ktx, const char *in, uint32_t level, const char *out, double deadline) {
-    char lv[16];
-    snprintf(lv, sizeof lv, "%u", level);
-    char *argv[] = { (char *)ktx, "extract", "--level", lv, (char *)in, (char *)out, NULL };
+static kql_status run_cmd(const char *exe, char *const argv[], double deadline) {
+    const char *ktx = exe;
 
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
@@ -262,8 +340,27 @@ static kql_status run_ktx(const char *ktx, const char *in, uint32_t level, const
     return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? KQL_OK : KQL_ERR_FAILED;
 }
 
+static kql_status run_ktx(const char *ktx, const char *in, uint32_t level, const char *out, double deadline) {
+    char lv[16];
+    snprintf(lv, sizeof lv, "%u", level);
+    char *argv[] = { (char *)ktx, "extract", "--level", lv, (char *)in, (char *)out, NULL };
+    return run_cmd(ktx, argv, deadline);
+}
+
+/* KTX1 -> временный KTX2 через ktx2ktx2 (лежит рядом с ktx) */
+static kql_status convert_ktx1(const char *ktx, const char *in, const char *out2, double deadline) {
+    char conv[PATH_MAX];
+    snprintf(conv, sizeof conv, "%s", ktx);
+    char *slash = strrchr(conv, '/');
+    if (!slash) return KQL_ERR_NO_KTX;
+    snprintf(slash + 1, sizeof conv - (size_t)(slash + 1 - conv), "ktx2ktx2");
+    if (!is_exec(conv)) return KQL_ERR_NO_KTX;
+    char *argv[] = { conv, "-o", (char *)out2, (char *)in, NULL };
+    return run_cmd(conv, argv, deadline);
+}
+
 /* ------------------------------------------------------------------ */
-kql_status kql_render(const char *path, kql_mode mode, unsigned target_px,
+static kql_status render_impl(const char *path, kql_mode mode, unsigned target_px,
                       char *out_path, size_t out_cap, kql_info *info_out) {
     g_cancel = 0;
     kql_info inf; struct stat st;
@@ -309,7 +406,15 @@ kql_status kql_render(const char *path, kql_mode mode, unsigned target_px,
     /* пока ждали слот, другой процесс мог уже сделать то же самое */
     if (stat(final, &cs) == 0 && cs.st_size > 0) { if (slot >= 0) close(slot); goto hit; }
 
-    s = run_ktx(ktx, path, inf.level_used, tmp, deadline);
+    if (inf.is_ktx1) {
+        char tmp2[PATH_MAX];
+        snprintf(tmp2, sizeof tmp2, "%s.k2", tmp);
+        s = convert_ktx1(ktx, path, tmp2, deadline);
+        if (s == KQL_OK) s = run_ktx(ktx, tmp2, inf.level_used, tmp, deadline);
+        unlink(tmp2);
+    } else {
+        s = run_ktx(ktx, path, inf.level_used, tmp, deadline);
+    }
     if (slot >= 0) close(slot);
     if (s == KQL_OK && (stat(tmp, &cs) != 0 || cs.st_size == 0)) s = KQL_ERR_FAILED;
     if (s != KQL_OK) { unlink(tmp); return s; }
@@ -321,4 +426,29 @@ hit:
     if (strlen(final) >= out_cap) return KQL_ERR_FAILED;
     strcpy(out_path, final);
     return KQL_OK;
+}
+
+/* Журнал: <cache>/ktxquicklook/log.txt — по строке на запрос, чтобы было видно, почему нет превью. */
+kql_status kql_render(const char *path, kql_mode mode, unsigned target_px,
+                      char *out_path, size_t out_cap, kql_info *info_out) {
+    kql_info tmp; if (!info_out) info_out = &tmp;
+    memset(info_out, 0, sizeof *info_out);
+    double t0 = now_s();
+    kql_status s = render_impl(path, mode, target_px, out_path, out_cap, info_out);
+    char dir[PATH_MAX], lf[PATH_MAX];
+    if (cache_dir(dir, sizeof dir) == 0) {
+        snprintf(lf, sizeof lf, "%s/log.txt", dir);
+        struct stat st;
+        if (stat(lf, &st) == 0 && st.st_size > 100000) unlink(lf);
+        FILE *f = fopen(lf, "a");
+        if (f) {
+            const char *k = find_ktx();
+            fprintf(f, "%ld %s %s -> %s | %ux%u mips=%u level=%u vk=%u scheme=%u | %.2fs | ktx=%s\n",
+                    (long)time(NULL), mode == KQL_THUMB ? "thumb" : "preview", path, kql_status_str(s),
+                    info_out->width, info_out->height, info_out->levels, info_out->level_used,
+                    info_out->vk_format, info_out->supercompression, now_s() - t0, k ? k : "(none)");
+            fclose(f);
+        }
+    }
+    return s;
 }
