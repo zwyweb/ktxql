@@ -13,7 +13,7 @@
 #define KQL_PREVIEW_MAX_MPIX 24        /* больше этого preview не строим */
 #endif
 #ifndef KQL_THUMB_MAX_MPIX
-#define KQL_THUMB_MAX_MPIX 8           /* больше этого иконку не строим */
+#define KQL_THUMB_MAX_MPIX 4           /* больше этого иконку не строим */
 #endif
 #ifndef KQL_PREVIEW_MAX_FILE_MB
 #define KQL_PREVIEW_MAX_FILE_MB 512
@@ -28,13 +28,31 @@
 #define KQL_THUMB_TIMEOUT_S 8
 #endif
 #ifndef KQL_MAX_PARALLEL
-#define KQL_MAX_PARALLEL 2             /* одновременно запущенных `ktx` на всю систему */
+#define KQL_MAX_PARALLEL 1             /* одновременно запущенных `ktx` на всю систему */
 #endif
 #ifndef KQL_CACHE_MAX_MB
-#define KQL_CACHE_MAX_MB 256
+#define KQL_CACHE_MAX_MB 32
 #endif
 #ifndef KQL_CACHE_MAX_FILES
-#define KQL_CACHE_MAX_FILES 1500
+#define KQL_CACHE_MAX_FILES 300
+#endif
+
+#ifndef KQL_CACHE_BIG_KB
+#define KQL_CACHE_BIG_KB 2048          /* файлы крупнее вытесняются первыми (быстро, через 60 с) */
+#endif
+/* Выбор mip-уровня: сколько уровней отступить от самого маленького (0 = самый маленький). */
+#ifndef KQL_THUMB_LEVELS_FROM_SMALLEST
+#define KQL_THUMB_LEVELS_FROM_SMALLEST 0
+#endif
+#ifndef KQL_PREVIEW_LEVELS_FROM_SMALLEST
+#define KQL_PREVIEW_LEVELS_FROM_SMALLEST 1
+#endif
+/* Нижняя граница: уровень с длинной стороной меньше этого не берём (1 = без ограничения). */
+#ifndef KQL_MIN_EDGE
+#define KQL_MIN_EDGE 1
+#endif
+#ifndef KQL_LOG
+#define KQL_LOG 0                      /* 1 = писать log.txt в каталоге кэша (для отладки) */
 #endif
 
 typedef enum {
