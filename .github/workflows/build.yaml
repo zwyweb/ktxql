@@ -27,13 +27,16 @@ jobs:
           plutil -lint "$B/Contents/Info.plist"
 
           clang -arch x86_64 -mmacosx-version-min=10.15 \
-                -bundle -O2 -Wall -Wno-deprecated-declarations -Wno-format-truncation \
+                -bundle -Os -DNDEBUG -fno-stack-protector -Wall -Wno-deprecated-declarations -Wno-format-truncation \
+                -Wl,-dead_strip \
                 -Isrc \
                 -o "$B/Contents/MacOS/KtxQuickLook" \
                 src/main.c src/ktxcore.c src/GeneratePreviewForURL.c src/GenerateThumbnailForURL.c \
                 -framework CoreFoundation -framework CoreServices \
                 -framework CoreGraphics -framework ImageIO -framework QuickLook
 
+          strip -x "$B/Contents/MacOS/KtxQuickLook"
+          ls -la "$B/Contents/MacOS/KtxQuickLook"
           lipo -info "$B/Contents/MacOS/KtxQuickLook"
           otool -l "$B/Contents/MacOS/KtxQuickLook" | grep -A3 -E "LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION" || true
           nm -gU "$B/Contents/MacOS/KtxQuickLook" | grep -E "QuickLookGeneratorPluginFactory|GeneratePreviewForURL|GenerateThumbnailForURL"
