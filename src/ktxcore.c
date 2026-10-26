@@ -340,11 +340,55 @@ static kql_status run_cmd(const char *exe, char *const argv[], double deadline) 
     return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? KQL_OK : KQL_ERR_FAILED;
 }
 
+static char g_detail[400] = "";
+
 static kql_status run_ktx(const char *ktx, const char *in, uint32_t level, const char *out, double deadline) {
-    char lv[16];
+    char lv[16], errp[PATH_MAX];
     snprintf(lv, sizeof lv, "%u", level);
+    snprintf(errp, sizeof errp, "%s.err", out);
     char *argv[] = { (char *)ktx, "extract", "--level", lv, (char *)in, (char *)out, NULL };
-    return run_cmd(ktx, argv, deadline);
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 2, errp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    pid_t pid;
+    int rc = posix_spawn(&pid, ktx, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) {
+        snprintf(g_detail, sizeof g_detail, "posix_spawn(%s) failed: %s", ktx, strerror(rc));
+        unlink(errp);
+        return KQL_ERR_FAILED;
+    }
+    setpriority(PRIO_PROCESS, (id_t)pid, 10);   /* фоновый приоритет, чтобы не лагал Finder */
+
+    int status = 0;
+    for (;;) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) break;
+        if (r < 0 && errno != EINTR) { snprintf(g_detail, sizeof g_detail, "waitpid: %s", strerror(errno)); unlink(errp); return KQL_ERR_FAILED; }
+        if (g_cancel || now_s() > deadline) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            unlink(errp);
+            return g_cancel ? KQL_ERR_CANCELLED : KQL_ERR_TIMEOUT;
+        }
+        sleep_ms(5);
+    }
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!ok) {
+        char line[300] = "";
+        FILE *f = fopen(errp, "r");
+        if (f) {
+            size_t n = fread(line, 1, sizeof line - 1, f); line[n] = 0; fclose(f);
+            for (char *c = line; *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+        }
+        if (WIFEXITED(status)) snprintf(g_detail, sizeof g_detail, "ktx exit %d: %s", WEXITSTATUS(status), line);
+        else snprintf(g_detail, sizeof g_detail, "ktx killed by signal %d: %s", WIFSIGNALED(status) ? WTERMSIG(status) : -1, line);
+    }
+    unlink(errp);
+    return ok ? KQL_OK : KQL_ERR_FAILED;
 }
 
 /* KTX1 -> временный KTX2 через ktx2ktx2 (лежит рядом с ktx) */
@@ -434,6 +478,7 @@ kql_status kql_render(const char *path, kql_mode mode, unsigned target_px,
     kql_info tmp; if (!info_out) info_out = &tmp;
     memset(info_out, 0, sizeof *info_out);
     double t0 = now_s();
+    g_detail[0] = 0;
     kql_status s = render_impl(path, mode, target_px, out_path, out_cap, info_out);
     char dir[PATH_MAX], lf[PATH_MAX];
     if (cache_dir(dir, sizeof dir) == 0) {
@@ -443,10 +488,10 @@ kql_status kql_render(const char *path, kql_mode mode, unsigned target_px,
         FILE *f = fopen(lf, "a");
         if (f) {
             const char *k = find_ktx();
-            fprintf(f, "%ld %s %s -> %s | %ux%u mips=%u level=%u vk=%u scheme=%u | %.2fs | ktx=%s\n",
+            fprintf(f, "%ld %s %s -> %s | %ux%u mips=%u level=%u vk=%u scheme=%u | %.2fs | ktx=%s | %s\n",
                     (long)time(NULL), mode == KQL_THUMB ? "thumb" : "preview", path, kql_status_str(s),
                     info_out->width, info_out->height, info_out->levels, info_out->level_used,
-                    info_out->vk_format, info_out->supercompression, now_s() - t0, k ? k : "(none)");
+                    info_out->vk_format, info_out->supercompression, now_s() - t0, k ? k : "(none)", g_detail);
             fclose(f);
         }
     }
